@@ -1,0 +1,34 @@
+@import url('https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;600;700&family=Share+Tech+Mono&display=swap');
+
+:root {
+  --r: #E8002D;
+  --bg: #0c0c0c;
+  --c1: #111111;
+  --c2: #161616;
+  --c3: #1e1e1e;
+  --brd: rgba(255, 255, 255, 0.07);
+  --brd2: rgba(255, 255, 255, 0.12);
+  --mut: rgba(255, 255, 255, 0.38);
+  --H: 'Rajdhani', sans-serif;
+  --M: 'Share Tech Mono', monospace;
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body, #root {
+  height: 100%;
+  background: var(--bg);
+  color: #fff;
+  font-family: var(--H);
+  -webkit-font-smoothing: antialiased;
+  overscroll-behavior: none;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #2a2a2a; border-radius: 2px; }
+
+/* iOS safe area */
+.safe-bottom { padding-bottom: env(safe-area-inset-bottom); }
+.safe-top { padding-top: env(safe-area-inset-top); }
