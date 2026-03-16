@@ -1,358 +1,262 @@
 """
-ProbabilityEngine — computes race win probabilities + tactical insights.
-
-Model inputs:
-  - Current gap to leader
-  - Tyre compound + age (deg model)
-  - Pit stop count + pit window estimate
-  - Track position × pace
-  - Safety car base rate (Bahrain ~23%)
-  - Remaining laps
-
-This is a heuristic model designed for real-time fan insight.
-Not a full Monte Carlo sim, but produces realistic outputs.
+F1 Race Probability Engine
+Exports: RaceState, DriverState, win_probability, podium_probability,
+         safety_car_probability, driver_insights
 """
 
 import math
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import List, Optional, Dict
 
-# Tyre degradation model: compound → (peak_laps, deg_per_lap_after_peak)
-TYRE_DEG = {
-    "S": {"peak": 15, "cliff": 20, "deg": 0.08},
-    "M": {"peak": 25, "cliff": 35, "deg": 0.05},
-    "H": {"peak": 40, "cliff": 55, "deg": 0.03},
-    "I": {"peak": 30, "cliff": 45, "deg": 0.06},
-    "W": {"peak": 35, "cliff": 50, "deg": 0.04},
-    "?": {"peak": 20, "cliff": 30, "deg": 0.06},
+TYRE_LIFE = {"SOFT": 22, "MEDIUM": 36, "HARD": 52, "INTER": 30, "WET": 40}
+TYRE_PACE = {"SOFT": 0.0, "MEDIUM": 0.4, "HARD": 0.9, "INTER": 3.5, "WET": 6.0}
+
+CIRCUIT_SC_RATE = {
+    "bahrain": 0.22, "jeddah": 0.38, "australia": 0.35, "albert_park": 0.35,
+    "baku": 0.45, "miami": 0.28, "monaco": 0.42, "montreal": 0.31,
+    "barcelona": 0.18, "red_bull_ring": 0.20, "silverstone": 0.25,
+    "hungaroring": 0.19, "spa": 0.30, "zandvoort": 0.20, "monza": 0.24,
+    "singapore": 0.50, "suzuka": 0.21, "austin": 0.27, "mexico_city": 0.22,
+    "interlagos": 0.35, "las_vegas": 0.32, "losail": 0.24, "yas_marina": 0.18,
+    "shanghai": 0.28, "madrid": 0.22, "default": 0.25,
 }
-
-# Average pit stop window for remaining laps heuristic
-PIT_WINDOW_BUFFER = 6  # laps before cliff to ideally pit
-
-SC_BASE_PROB = 0.23    # Bahrain historical SC rate per race
-RF_BASE_PROB = 0.08    # Red flag
-VSC_BASE_PROB = 0.15   # VSC
-
-# Gap in seconds that makes overtaking feasible in open air
-DRS_WINDOW = 1.0
-ATTACK_WINDOW = 2.5
-COMFORTABLE_GAP = 5.0
 
 
 @dataclass
 class DriverState:
-    number: str
+    driver_code: str
     position: int
-    short_name: str
-    full_name: str
-    team: str
-    gap_raw: Optional[float]        # seconds behind leader, None for leader
-    tyre: str
-    tyre_age: int
-    last_lap_raw: Optional[float]
-    pit_stops: int
+    gap_to_leader: float = 0.0
+    interval: float = 0.0
+    tyre_compound: str = "MEDIUM"
+    tyre_age: int = 1
+    last_lap_time: float = 92.0
+    best_lap_time: float = 91.5
+    pit_stops: int = 0
+    total_laps: int = 57
+    laps_completed: int = 1
+    team: str = ""
+    drs_available: bool = False
+    speed: float = 300.0
+    throttle: float = 80.0
+    brake: float = 0.0
+    gear: int = 7
+    rpm: int = 11000
+
+
+@dataclass
+class RaceState:
+    circuit: str
+    total_laps: int
     current_lap: int
+    drivers: List[DriverState] = field(default_factory=list)
+    weather: str = "dry"
+    track_temp: float = 35.0
+    air_temp: float = 24.0
+    safety_car_active: bool = False
+    vsc_active: bool = False
 
 
-class ProbabilityEngine:
+# ── Internal helpers ──────────────────────────────────────────────────────────
 
-    def compute(self, state: dict) -> dict:
-        """Compute all probabilities from live state dict."""
-        drivers_raw = state.get("drivers", [])
-        total_laps = state.get("total_laps", 57)
-        current_lap = state.get("current_lap", 1)
-        remaining = max(1, total_laps - current_lap)
+def _tyre_deg(compound: str, age: int) -> float:
+    max_life = TYRE_LIFE.get(compound, 36)
+    base     = TYRE_PACE.get(compound, 0.5)
+    ratio    = age / max_life
+    if ratio < 0.5:
+        return round(base + ratio * 0.3, 3)
+    elif ratio < 0.85:
+        return round(base + 0.15 + (ratio - 0.5) * 1.2, 3)
+    else:
+        return round(base + 0.57 + (ratio - 0.85) * 4.0, 3)
 
-        drivers = [self._parse_driver(d) for d in drivers_raw]
-        if not drivers:
-            return {}
 
-        # Compute relative pace score per driver
-        pace_scores = self._pace_scores(drivers)
+def _pit_prob(d: DriverState, state: RaceState) -> float:
+    remaining = max(0, TYRE_LIFE.get(d.tyre_compound, 36) - d.tyre_age)
+    if remaining <= 0:   return 0.95
+    elif remaining <= 3: return 0.75
+    elif remaining <= 7: return 0.35
+    else:                return 0.05
 
-        # Tyre health scores
-        tyre_scores = {d.number: self._tyre_score(d.tyre, d.tyre_age) for d in drivers}
 
-        # Gap scores (closer = harder to win, but also position effect)
-        raw_win = {}
-        for d in drivers:
-            gap_pen = 0.0
-            if d.gap_raw is not None:
-                # Exponential penalty on gap
-                gap_pen = math.exp(-d.gap_raw / 30.0)
-            else:
-                gap_pen = 1.0  # leader
+# ── Public API ────────────────────────────────────────────────────────────────
 
-            pos_factor = math.exp(-0.28 * (d.position - 1))
-            pace = pace_scores.get(d.number, 0.5)
-            tyre = tyre_scores.get(d.number, 0.5)
+def win_probability(state: RaceState) -> Dict[str, float]:
+    laps_left = state.total_laps - state.current_lap
+    if laps_left <= 0:
+        leader = min(state.drivers, key=lambda d: d.position, default=None)
+        return {d.driver_code: (1.0 if leader and d.driver_code == leader.driver_code else 0.0) for d in state.drivers}
 
-            # SC wild-card: adds random-redistribution factor based on SC prob
-            sc_uplift = SC_BASE_PROB * (1 / max(d.position, 1)) * 0.3
-
-            score = (gap_pen * 0.45 + pos_factor * 0.30 + pace * 0.15 + tyre * 0.10) + sc_uplift
-            raw_win[d.number] = max(0.001, score)
-
-        # Normalise to 100%
-        total = sum(raw_win.values())
-        win_probs = {k: round(v / total * 100, 1) for k, v in raw_win.items()}
-
-        # Podium probabilities (top-3 chance)
-        pod_probs = {}
-        for d in drivers:
-            pos_factor = math.exp(-0.18 * (d.position - 1))
-            pace = pace_scores.get(d.number, 0.5)
-            tyre = tyre_scores.get(d.number, 0.5)
-            sc_factor = SC_BASE_PROB * (1 / max(d.position - 1, 1)) * 0.15
-            raw = pos_factor * 0.55 + pace * 0.25 + tyre * 0.20 + sc_factor
-            pod_probs[d.number] = raw
-
-        pod_total = sum(pod_probs.values())
-        pod_probs = {k: min(99, round(v / pod_total * 3 * 100, 0)) for k, v in pod_probs.items()}
-
-        # Incident probabilities — modulated by remaining laps
-        sc_prob = round(min(65, SC_BASE_PROB * 100 * (1 - current_lap / total_laps * 0.4)), 0)
-        rf_prob = round(min(30, RF_BASE_PROB * 100 * (1 - current_lap / total_laps * 0.3)), 0)
-        vsc_prob = round(min(40, VSC_BASE_PROB * 100 * (1 - current_lap / total_laps * 0.2)), 0)
-
-        # Fastest-lap contender
-        fl_candidates = sorted(drivers, key=lambda d: pace_scores.get(d.number, 0), reverse=True)[:3]
-
-        # Pit windows
-        pit_windows = {}
-        for d in drivers:
-            pw = self._pit_window(d, remaining, total_laps)
-            if pw:
-                pit_windows[d.number] = pw
-
-        return {
-            "win":         win_probs,
-            "podium":      pod_probs,
-            "sc_prob":     int(sc_prob),
-            "rf_prob":     int(rf_prob),
-            "vsc_prob":    int(vsc_prob),
-            "fl_candidates": [d.short_name for d in fl_candidates],
-            "pit_windows": pit_windows,
-        }
-
-    def driver_insights(self, driver_number: str, state: dict, probs: dict) -> dict:
-        """Generate tactical insight cards for a specific driver."""
-        drivers_raw = state.get("drivers", [])
-        total_laps = state.get("total_laps", 57)
-        current_lap = state.get("current_lap", 1)
-        remaining = max(1, total_laps - current_lap)
-
-        drivers = {d["driver_number"]: self._parse_driver(d) for d in drivers_raw}
-        driver = drivers.get(driver_number)
-        if not driver:
-            return {"error": "Driver not found"}
-
-        win_pct = probs.get("win", {}).get(driver_number, 0)
-        pod_pct = probs.get("podium", {}).get(driver_number, 0)
-        sc_prob = probs.get("sc_prob", 23)
-        pit_window = probs.get("pit_windows", {}).get(driver_number)
-
-        # Driver ahead/behind
-        ahead = next((d for d in drivers.values() if d.position == driver.position - 1), None)
-        behind = next((d for d in drivers.values() if d.position == driver.position + 1), None)
-
-        # Tyre health
-        tyre_health = self._tyre_score(driver.tyre, driver.tyre_age)
-        deg = TYRE_DEG.get(driver.tyre, TYRE_DEG["?"])
-        laps_until_cliff = max(0, deg["cliff"] - driver.tyre_age)
-
-        scenarios = []
-
-        # ── Card 1: Current status ────────────────────────────────────────────
-        if driver.position == 1:
-            gap_ahead_txt = "Leading the race."
-            margin_txt = f"Gap to P2: {abs(behind.gap_raw - (driver.gap_raw or 0)):.1f}s." if behind and behind.gap_raw else ""
-            scenarios.append({
-                "tag": "STATUS", "type": "info",
-                "title": f"Race leader — managing from the front",
-                "body": f"{gap_ahead_txt} {margin_txt} Tyre age at {driver.tyre_age} laps on {driver.tyre} compound.",
-                "prob": None,
-            })
+    scores = {}
+    for d in state.drivers:
+        # Gap penalty
+        if d.position == 1:
+            gap_score = 1.0
         else:
-            gap_s = driver.gap_raw or 0
-            gap_txt = f"{gap_s:.1f}s behind leader"
-            iv_txt = f", {(driver.gap_raw or 0) - (ahead.gap_raw or 0):.1f}s to P{ahead.position}" if ahead and ahead.gap_raw is not None else ""
-            tyre_txt = f"{driver.tyre} tyres at {driver.tyre_age} laps"
+            laps_to_close = d.gap_to_leader / 0.1 if d.gap_to_leader else 9999
+            gap_score = max(0.0, 1.0 - (laps_to_close / max(laps_left, 1)))
+
+        # Pace score
+        best_times = [x.best_lap_time for x in state.drivers if x.best_lap_time > 0]
+        if best_times:
+            field_best = min(best_times)
+            pace_score = math.exp(-(d.best_lap_time - field_best) * 1.5)
+        else:
+            pace_score = 1.0 / max(len(state.drivers), 1)
+
+        # Tyre score
+        deg_now = _tyre_deg(d.tyre_compound, d.tyre_age)
+        deg_end = _tyre_deg(d.tyre_compound, d.tyre_age + laps_left)
+        tyre_score = math.exp(-((deg_now + deg_end) / 2) * 0.4)
+
+        # Position bonus
+        pos_score = 1.0 / (d.position ** 0.7)
+
+        # Pit risk
+        strategy_score = 1.0 - _pit_prob(d, state) * 0.15
+
+        combined = (gap_score * 0.35 + pace_score * 0.25 +
+                    tyre_score * 0.15 + pos_score * 0.15 + strategy_score * 0.10)
+        scores[d.driver_code] = max(0.001, combined)
+
+    total = sum(scores.values())
+    return {k: round(v / total, 4) for k, v in scores.items()}
+
+
+def podium_probability(state: RaceState) -> Dict[str, float]:
+    win_probs = win_probability(state)
+    result = {}
+    for d in state.drivers:
+        wp = win_probs.get(d.driver_code, 0)
+        if   d.position == 1: p = 0.88 + wp * 0.10
+        elif d.position == 2: p = 0.72 + wp * 0.10
+        elif d.position == 3: p = 0.60 + wp * 0.08
+        elif d.position <= 6: p = max(0.02, 0.25 - (d.position - 3) * 0.05 + wp * 0.20)
+        else:                 p = max(0.005, wp * 0.15)
+        result[d.driver_code] = round(min(p, 0.99), 3)
+    return result
+
+
+def safety_car_probability(state: RaceState) -> Dict[str, float]:
+    laps_left    = state.total_laps - state.current_lap
+    circuit_rate = CIRCUIT_SC_RATE.get(state.circuit.lower(), CIRCUIT_SC_RATE["default"])
+    sc_base      = 1 - (1 - circuit_rate) ** max(laps_left / 10, 0.1)
+    if state.weather == "damp": sc_base = min(0.95, sc_base * 1.6)
+    elif state.weather == "wet": sc_base = min(0.98, sc_base * 2.2)
+    return {
+        "safety_car": round(min(sc_base, 0.95), 3),
+        "red_flag":   round(min(sc_base * 0.28, 0.55), 3),
+        "vsc":        round(min(sc_base * 0.55, 0.75), 3),
+    }
+
+
+def _overtake_scenarios(driver: DriverState, target: DriverState, state: RaceState) -> List[dict]:
+    if not target or driver.position >= target.position:
+        return []
+    laps_left = state.total_laps - state.current_lap
+    interval  = driver.interval
+    sc_probs  = safety_car_probability(state)
+    scenarios = []
+
+    # Tyre delta
+    driver_deg = _tyre_deg(driver.tyre_compound, driver.tyre_age)
+    target_deg = _tyre_deg(target.tyre_compound, target.tyre_age)
+    delta = target_deg - driver_deg
+    if delta > 0.1:
+        laps_to_close = interval / max(delta, 0.05)
+        if laps_to_close <= laps_left:
             scenarios.append({
-                "tag": "STATUS", "type": "info",
-                "title": f"P{driver.position} — {gap_txt}",
-                "body": f"{gap_txt}{iv_txt}. {tyre_txt}. {remaining} laps remaining.",
-                "prob": None,
+                "tag": "TYRE DELTA", "type": "opportunity",
+                "title": f"{target.driver_code} tyre cliff in ~{max(1,int(laps_to_close))} laps",
+                "body": f"{target.driver_code} on {target.tyre_age}-lap {target.tyre_compound.lower()}s losing ~{delta:.2f}s/lap. Gap closes to DRS by Lap {state.current_lap + max(1,int(laps_to_close))}.",
+                "probability": round(min(0.78, 0.3 + delta * 0.6), 2),
             })
 
-        # ── Card 2: Tyre / threat ─────────────────────────────────────────────
-        if tyre_health < 0.4:
-            scenarios.append({
-                "tag": "TYRE RISK", "type": "risk",
-                "title": f"{driver.tyre} compound approaching cliff",
-                "body": f"At {driver.tyre_age} laps, {driver.short_name} is ~{laps_until_cliff} laps from the degradation cliff. Lap times will begin to fall, opening the door for undercut.",
-                "prob": f"{min(75, 100 - int(tyre_health * 100))}%",
-            })
-        elif ahead and laps_until_cliff < 8:
-            scenarios.append({
-                "tag": "ATTACK", "type": "opportunity",
-                "title": f"Tyre delta opens attack window in ~{laps_until_cliff} laps",
-                "body": f"{driver.short_name}'s fresher tyres will outpace P{ahead.position} once their compound starts degrading. Gap can close by 0.2–0.4s per lap.",
-                "prob": f"{min(55, int((1 - tyre_health) * 80))}%",
-            })
-
-        # ── Card 3: Pit stop window ───────────────────────────────────────────
-        if pit_window:
-            scenarios.append({
-                "tag": "PIT WINDOW", "type": "warning",
-                "title": f"Optimal stop: Laps {pit_window[0]}–{pit_window[1]}",
-                "body": self._pit_narrative(driver, ahead, pit_window),
-                "prob": None,
-            })
-
-        # ── Card 4: Safety car scenario ───────────────────────────────────────
-        sc_pos_gain = max(0, driver.position - 2)  # best realistic gain
+    # Pit stop
+    target_pit = _pit_prob(target, state)
+    if target_pit > 0.3:
+        underover = "Undercut" if interval < 6 else "Overcut"
         scenarios.append({
-            "tag": "SC FACTOR", "type": "opportunity" if driver.position > 3 else "warning",
-            "title": "Safety car compresses field to zero",
-            "body": f"With {sc_prob}% SC probability, any neutralisation removes {driver.gap_raw:.1f}s gap instantly." if driver.gap_raw else f"SC probability at {sc_prob}%. Would create sprint-to-finish from current P{driver.position}.",
-            "prob": f"{sc_prob}%",
+            "tag": "PIT WINDOW", "type": "opportunity",
+            "title": f"{underover} on {target.driver_code}'s stop",
+            "body": f"{target.driver_code} likely stops within 5 laps ({int(target_pit*100)}% probability). A well-timed pit gains track position.",
+            "probability": round(target_pit * 0.65, 2),
         })
 
-        # ── Card 5: Direct threat or opportunity ─────────────────────────────
-        if behind:
-            gap_behind = abs((driver.gap_raw or 0) - (behind.gap_raw or 0)) if behind.gap_raw else None
-            if gap_behind is not None:
-                if gap_behind < DRS_WINDOW:
-                    behind_tyre = TYRE_DEG.get(behind.tyre, TYRE_DEG["?"])
-                    behind_health = self._tyre_score(behind.tyre, behind.tyre_age)
-                    scenarios.append({
-                        "tag": "THREAT", "type": "risk",
-                        "title": f"{behind.short_name} in DRS range — defend required",
-                        "body": f"P{behind.position} is {gap_behind:.2f}s behind and within DRS activation. {behind.short_name} on {behind.tyre} tyres ({behind.tyre_age} laps) — {'fresher compound, pace advantage' if behind_health > 0.7 else 'similar tyre age'}.",
-                        "prob": f"{min(65, int((1 - gap_behind / DRS_WINDOW) * 60))}%",
-                    })
-                elif gap_behind < ATTACK_WINDOW:
-                    scenarios.append({
-                        "tag": "MONITOR", "type": "warning",
-                        "title": f"{behind.short_name} closing — {gap_behind:.1f}s back",
-                        "body": f"P{behind.position} closing at current pace. Will enter DRS range in ~{max(1, int(gap_behind / 0.3))} laps if pace differential continues.",
-                        "prob": None,
-                    })
-
-        if ahead:
-            gap_ahead = abs((driver.gap_raw or 0) - (ahead.gap_raw or 0)) if ahead.gap_raw is not None and driver.gap_raw is not None else None
-            if gap_ahead is not None and gap_ahead < ATTACK_WINDOW:
-                ahead_tyre_cliff = max(0, TYRE_DEG.get(ahead.tyre, TYRE_DEG["?"])["cliff"] - ahead.tyre_age)
-                scenarios.append({
-                    "tag": "OPPORTUNITY", "type": "opportunity",
-                    "title": f"{gap_ahead:.1f}s to P{ahead.position} — inside attack window",
-                    "body": f"{ahead.short_name} on {ahead.tyre} ({ahead.tyre_age} laps). Their deg cliff arrives in ~{ahead_tyre_cliff} laps. {driver.short_name} can attack into Turn 1 or via undercut at pit window.",
-                    "prob": f"{min(55, int(40 * (1 - gap_ahead / ATTACK_WINDOW)))}%",
-                })
-
-        # ── Card 6: Win probability card ─────────────────────────────────────
-        if driver.position == 1:
-            wp_body = f"Full race control. Needs clean pit stop and no mechanical issues to seal victory."
-        elif win_pct >= 15:
-            wp_body = f"Realistic contender. Strategy + pace delta are the key variables over the next {min(remaining, 20)} laps."
-        elif win_pct >= 5:
-            wp_body = f"Requires P1/P2 to make errors or have an incident. SC + undercut strategy = best path to podium."
-        else:
-            wp_body = f"From P{driver.position}, win requires significant chaos ahead. Best focus: protect current position and maximise points."
-
+    # DRS
+    if interval < 2.5:
+        drs_gain = 0.35 if state.circuit in ["baku","monza","spa","albert_park","shanghai"] else 0.22
+        laps_needed = math.ceil(interval / max(drs_gain, 0.01))
         scenarios.append({
-            "tag": "WIN PATH", "type": "opportunity" if win_pct >= 15 else "risk",
-            "title": f"{win_pct}% race win probability",
-            "body": wp_body,
-            "prob": f"{win_pct}%",
+            "tag": "DRS ATTACK", "type": "opportunity",
+            "title": f"DRS zone — close at 0.{int(drs_gain*100)}s/lap",
+            "body": f"Inside DRS window. Speed advantage in detection zone. Overtake completable in ~{laps_needed} lap(s) with clean air into Turn 1.",
+            "probability": round(min(0.6, drs_gain * 1.5), 2),
         })
 
-        return {
-            "driver_number": driver_number,
-            "short_name":    driver.short_name,
-            "full_name":     driver.full_name,
-            "team":          driver.team,
-            "position":      driver.position,
-            "win_prob":      win_pct,
-            "podium_prob":   int(pod_pct),
-            "tyre_health":   round(tyre_health, 2),
-            "laps_to_cliff": laps_until_cliff,
-            "scenarios":     scenarios[:6],  # max 6 cards
-        }
+    # SC reset
+    if interval > 5:
+        scenarios.append({
+            "tag": "SC FACTOR", "type": "wildcard",
+            "title": f"Safety car resets {interval:.1f}s gap to zero",
+            "body": f"SC bunches the field instantly. On restart, {driver.driver_code} on {'fresher' if driver.tyre_age < target.tyre_age else 'comparable'} tyres attacks straight into T1.",
+            "probability": round(sc_probs["safety_car"] * 0.55, 2),
+        })
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
-    def _parse_driver(self, d: dict) -> DriverState:
-        gap_raw = None
-        gap_str = d.get("gap", "")
-        if gap_str and gap_str not in ("LEADER", "---"):
-            try:
-                gap_raw = float(gap_str.replace("+", "").replace("LAP", "60"))
-            except ValueError:
-                pass
-        return DriverState(
-            number=d.get("driver_number", "?"),
-            position=d.get("position", 99),
-            short_name=d.get("short_name", "???"),
-            full_name=d.get("full_name", ""),
-            team=d.get("team", ""),
-            gap_raw=gap_raw,
-            tyre=d.get("tyre", "?"),
-            tyre_age=d.get("tyre_age", 0),
-            last_lap_raw=d.get("last_lap_raw"),
-            pit_stops=d.get("pit_stops", 0),
-            current_lap=d.get("current_lap", 0),
-        )
+    # Threat from behind
+    behind = next((x for x in state.drivers if x.position == driver.position + 1), None)
+    if behind:
+        behind_delta = driver_deg - _tyre_deg(behind.tyre_compound, behind.tyre_age)
+        if behind_delta > 0.05:
+            scenarios.append({
+                "tag": "THREAT", "type": "risk",
+                "title": f"{behind.driver_code} closing from P{behind.position} at {behind_delta:.2f}s/lap",
+                "body": f"P{behind.position} {behind.driver_code} on {behind.tyre_compound.lower()} tyres is quicker. Defend or pit before the gap disappears.",
+                "probability": round(min(0.55, behind_delta * 0.8), 2),
+            })
 
-    def _tyre_score(self, compound: str, age: int) -> float:
-        """Returns 0 (dead) to 1 (fresh) tyre health score."""
-        deg = TYRE_DEG.get(compound, TYRE_DEG["?"])
-        if age <= deg["peak"]:
-            return 1.0
-        if age >= deg["cliff"]:
-            return max(0.05, 1.0 - (age - deg["cliff"]) * deg["deg"] * 3)
-        ratio = (age - deg["peak"]) / (deg["cliff"] - deg["peak"])
-        return max(0.1, 1.0 - ratio * 0.7)
+    # Win path
+    win_probs = win_probability(state)
+    win_p = win_probs.get(driver.driver_code, 0)
+    scenarios.append({
+        "tag": "WIN PATH",
+        "type": "risk" if win_p < 0.1 else "opportunity",
+        "title": f"Win probability: {int(win_p*100)}%",
+        "body": (f"Realistic ceiling: P{max(1, driver.position-1 if win_p > 0.15 else driver.position)} today. Need {driver.position-1} car(s) ahead to have issues."
+                 if win_p < 0.3 else
+                 f"Genuine race win contender. Clean strategy and no incidents puts {driver.driver_code} in the fight."),
+        "probability": round(win_p, 2),
+    })
 
-    def _pace_scores(self, drivers: list[DriverState]) -> dict:
-        """Normalised pace score based on latest lap time."""
-        valid = [(d.number, d.last_lap_raw) for d in drivers if d.last_lap_raw]
-        if not valid:
-            return {d.number: 0.5 for d in drivers}
-        times = [t for _, t in valid]
-        best, worst = min(times), max(times)
-        spread = max(worst - best, 0.001)
-        scores = {num: 1.0 - (t - best) / spread for num, t in valid}
-        for d in drivers:
-            if d.number not in scores:
-                scores[d.number] = 0.3
-        return scores
+    return scenarios[:5]
 
-    def _pit_window(self, driver: DriverState, remaining: int, total_laps: int) -> tuple | None:
-        """Returns (lap_from, lap_to) for optimal pit window, or None if already pitted optimally."""
-        deg = TYRE_DEG.get(driver.tyre, TYRE_DEG["?"])
-        laps_to_cliff = max(0, deg["cliff"] - driver.tyre_age)
-        current = total_laps - remaining
 
-        if laps_to_cliff <= 0:
-            # Should already be pitting
-            return (current + 1, current + 3)
-        if laps_to_cliff > remaining:
-            # Can potentially one-stop
-            return None
-        ideal_lap = current + max(1, laps_to_cliff - PIT_WINDOW_BUFFER)
-        return (ideal_lap, ideal_lap + 4)
+def driver_insights(driver_code: str, state: RaceState) -> dict:
+    driver = next((d for d in state.drivers if d.driver_code == driver_code), None)
+    if not driver:
+        return {"error": f"Driver {driver_code} not found in current race state"}
 
-    def _pit_narrative(self, driver: DriverState, ahead, pit_window: tuple) -> str:
-        lap_from, lap_to = pit_window
-        if ahead:
-            return (
-                f"Best pit window is Laps {lap_from}–{lap_to}. "
-                f"If {ahead.short_name} pits 1 lap later, {driver.short_name} can emerge ahead on fresher rubber "
-                f"with ~2–3s clear air — classic undercut opportunity."
-            )
-        return (
-            f"Optimal stop between Laps {lap_from}–{lap_to} to take on fresh rubber for the final stint. "
-            f"Staying out risks a lap-time cliff dropping pace by 0.3–0.8s per lap."
-        )
+    target   = next((d for d in state.drivers if d.position == driver.position - 1), None)
+    win_probs = win_probability(state)
+    pod_probs = podium_probability(state)
+    scenarios = _overtake_scenarios(driver, target, state)
+
+    if not scenarios or all(s["type"] not in ("opportunity",) for s in scenarios):
+        deg = _tyre_deg(driver.tyre_compound, driver.tyre_age)
+        remaining = max(0, TYRE_LIFE.get(driver.tyre_compound, 36) - driver.tyre_age)
+        scenarios.insert(0, {
+            "tag": "STATUS", "type": "info",
+            "title": f"P{driver.position} — {'managing pace' if deg > 0.5 else 'strong pace'}",
+            "body": f"{driver.tyre_compound.title()} tyres at {driver.tyre_age} laps. Deg penalty: +{deg:.2f}s/lap. ~{remaining} laps remaining on current compound.",
+            "probability": None,
+        })
+
+    return {
+        "driver_code":        driver_code,
+        "win_probability":    round(win_probs.get(driver_code, 0), 4),
+        "podium_probability": round(pod_probs.get(driver_code, 0), 4),
+        "tyre_deg":           round(_tyre_deg(driver.tyre_compound, driver.tyre_age), 3),
+        "laps_on_tyre":       driver.tyre_age,
+        "pit_probability_5":  round(_pit_prob(driver, state), 3),
+        "scenarios":          scenarios,
+    }
