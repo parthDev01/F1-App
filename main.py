@@ -20,7 +20,7 @@ from calendar_2026 import (
     get_track_history,
     get_race_status, CALENDAR_2026,
     get_last_race_results, get_standings, get_constructor_standings,
-    refresh_live_data,
+    refresh_live_data, get_replay_data,
 )
 from probability import (
     RaceState, DriverState,
@@ -262,6 +262,21 @@ async def get_probabilities():
 @app.get("/api/track/{circuit}")
 async def get_track_info(circuit: str):
     return {"circuit": circuit, "history": get_track_history(circuit)}
+
+
+@app.get("/api/last-race/replay")
+async def get_race_replay():
+    """Lap-by-lap position data for the last race — powers the replay animation."""
+    data = await get_replay_data()
+    last = get_last_race_results()
+    return {
+        "round":        last.get("round"),
+        "race_name":    last.get("name"),
+        "circuit":      last.get("circuit"),
+        "total_laps":   last.get("total_laps", 56),
+        "has_live_data": data is not None,
+        "laps":         data or {},
+    }
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
