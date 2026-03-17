@@ -17,8 +17,9 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from live_data import build_race_state, get_latest_session
 from calendar_2026 import (
-    get_race_status, CALENDAR_2026, LAST_RACE_RESULTS,
-    STANDINGS_2026, CONSTRUCTOR_STANDINGS_2026
+    get_race_status, CALENDAR_2026,
+    get_last_race_results, get_standings, get_constructor_standings,
+    refresh_live_data,
 )
 from probability import (
     RaceState, DriverState,
@@ -29,47 +30,47 @@ import f1_data as ff1
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s %(message)s")
 log = logging.getLogger("f1.main")
 
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "5"))
+POLL_INTERVAL      = int(os.getenv("POLL_INTERVAL", "5"))
+RESULTS_REFRESH    = int(os.getenv("RESULTS_REFRESH", "1800"))  # 30 min
 
 
 class AppState:
     race_state: dict = {}
-    last_poll: float = 0.0
-    clients: Set[WebSocket] = set()
+    last_poll:  float = 0.0
+    clients:    Set[WebSocket] = set()
     total_laps: int = 57
 
 app_state = AppState()
 
 
 def build_between_races_state() -> dict:
-    """State served when no race is live — shows last race + next race info."""
     status = get_race_status()
     return {
-        "mode":          "between_races",
-        "demo_mode":     False,
-        "is_live":       False,
-        "race_status":   status,
-        "last_race":     LAST_RACE_RESULTS,
-        "next_race":     status.get("next_race"),
+        "mode":            "between_races",
+        "demo_mode":       False,
+        "is_live":         False,
+        "race_status":     status,
+        "last_race":       get_last_race_results(),
+        "next_race":       status.get("next_race"),
         "days_until_next": status.get("days_until_next"),
-        "standings":     STANDINGS_2026,
-        "constructors":  CONSTRUCTOR_STANDINGS_2026,
-        "calendar":      CALENDAR_2026,
-        "drivers":       [],
-        "current_lap":   0,
-        "total_laps":    0,
-        "circuit":       status.get("last_race", {}).get("circuit", "shanghai"),
-        "circuit_name":  status.get("last_race", {}).get("circuit_name", ""),
-        "weather":       "dry",
-        "safety_car":    False,
-        "vsc":           False,
-        "track_temp":    25,
-        "air_temp":      20,
+        "standings":       get_standings(),
+        "constructors":    get_constructor_standings(),
+        "calendar":        CALENDAR_2026,
+        "drivers":         [],
+        "current_lap":     0,
+        "total_laps":      0,
+        "circuit":         status.get("last_race", {}).get("circuit", "shanghai"),
+        "circuit_name":    status.get("last_race", {}).get("circuit_name", ""),
+        "weather":         "dry",
+        "safety_car":      False,
+        "vsc":             False,
+        "track_temp":      25,
+        "air_temp":        20,
     }
 
 
 def dict_to_race_state(raw: dict) -> RaceState:
-    drivers = []
+    drivers    = []
     total_laps = raw.get("total_laps", app_state.total_laps)
     for d in raw.get("drivers", []):
         drivers.append(DriverState(
@@ -106,7 +107,7 @@ def enrich_with_probabilities(raw: dict) -> dict:
     if not raw.get("drivers"):
         return raw
     try:
-        rs = dict_to_race_state(raw)
+        rs        = dict_to_race_state(raw)
         win_probs = win_probability(rs)
         pod_probs = podium_probability(rs)
         sc_probs  = safety_car_probability(rs)
@@ -120,27 +121,35 @@ def enrich_with_probabilities(raw: dict) -> dict:
     return raw
 
 
+async def results_refresh_loop():
+    """Refresh race results + standings from Jolpica every 30 minutes."""
+    while True:
+        try:
+            await refresh_live_data()
+        except Exception as e:
+            log.error(f"Results refresh error: {e}")
+        await asyncio.sleep(RESULTS_REFRESH)
+
+
 async def poll_live_data():
+    """Poll OpenF1 every POLL_INTERVAL seconds during race weekends."""
     async with httpx.AsyncClient() as client:
         while True:
             try:
                 status = get_race_status()
-
                 if status["is_live"]:
-                    # Try OpenF1 live data
                     session = await get_latest_session(client)
                     if session:
-                        app_state.total_laps = status["active_race"].get("total_laps", 57)
                         raw = await build_race_state(session["session_key"])
-                        raw["circuit"]       = status["active_race"]["circuit"]
-                        raw["circuit_name"]  = status["active_race"]["circuit_name"]
-                        raw["total_laps"]    = app_state.total_laps
-                        raw["is_live"]       = True
-                        raw["demo_mode"]     = False
-                        raw["race_status"]   = status
-                        raw["next_race"]     = status.get("next_race")
-                        raw["standings"]     = STANDINGS_2026
-                        raw["constructors"]  = CONSTRUCTOR_STANDINGS_2026
+                        raw["circuit"]      = status["active_race"]["circuit"] if status.get("active_race") else raw.get("circuit","unknown")
+                        raw["circuit_name"] = status["active_race"]["circuit_name"] if status.get("active_race") else ""
+                        raw["total_laps"]   = app_state.total_laps
+                        raw["is_live"]      = True
+                        raw["demo_mode"]    = False
+                        raw["race_status"]  = status
+                        raw["next_race"]    = status.get("next_race")
+                        raw["standings"]    = get_standings()
+                        raw["constructors"] = get_constructor_standings()
                         app_state.race_state = enrich_with_probabilities(raw)
                     else:
                         app_state.race_state = build_between_races_state()
@@ -149,9 +158,8 @@ async def poll_live_data():
 
                 app_state.last_poll = time.time()
 
-                # Broadcast to WebSocket clients
                 if app_state.clients:
-                    msg = json.dumps({"type": "race_update", "data": app_state.race_state})
+                    msg  = json.dumps({"type": "race_update", "data": app_state.race_state})
                     dead = set()
                     for ws in app_state.clients:
                         try:
@@ -168,58 +176,48 @@ async def poll_live_data():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Initialise with between-races state immediately
+    # Fetch live results immediately on startup
+    await refresh_live_data()
     app_state.race_state = build_between_races_state()
-    task = asyncio.create_task(poll_live_data())
+    # Start background tasks
+    t1 = asyncio.create_task(poll_live_data())
+    t2 = asyncio.create_task(results_refresh_loop())
     yield
-    task.cancel()
+    t1.cancel()
+    t2.cancel()
 
 
-app = FastAPI(title="F1 Tracker API", version="2.0.0", lifespan=lifespan)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI(title="F1 Tracker API", version="2.1.0", lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
 @app.get("/")
 async def root():
     return {"status": "F1 Tracker API running", "docs": "/docs"}
 
-
 @app.get("/api/race")
 async def get_race():
     return enrich_with_probabilities(app_state.race_state.copy())
 
-
 @app.get("/api/status")
 async def get_status():
-    """Current race weekend status — live / between races / next race countdown."""
     return get_race_status()
-
 
 @app.get("/api/calendar")
 async def get_calendar():
     return {"season": 2026, "rounds": len(CALENDAR_2026), "calendar": CALENDAR_2026}
 
-
 @app.get("/api/standings")
-async def get_standings():
+async def get_standings_endpoint():
     return {
-        "season": 2026,
-        "after_round": LAST_RACE_RESULTS["round"],
-        "drivers":      STANDINGS_2026,
-        "constructors": CONSTRUCTOR_STANDINGS_2026,
+        "season":       2026,
+        "drivers":      get_standings(),
+        "constructors": get_constructor_standings(),
     }
-
 
 @app.get("/api/last-race")
 async def get_last_race():
-    return LAST_RACE_RESULTS
-
+    return get_last_race_results()
 
 @app.get("/api/driver/{driver_code}/insights")
 async def get_driver_insights(driver_code: str):
@@ -228,38 +226,26 @@ async def get_driver_insights(driver_code: str):
         return {"error": "No live race data available"}
     return driver_insights(driver_code.upper(), rs)
 
-
 @app.get("/api/season/{year}/schedule")
 async def get_schedule(year: int):
     if year == 2026:
         return {"year": 2026, "schedule": CALENDAR_2026}
-    schedule = ff1.get_race_schedule(year)
-    return {"year": year, "schedule": schedule}
-
+    return {"year": year, "schedule": ff1.get_race_schedule(year)}
 
 @app.get("/api/session/{year}/{round_name}/laps")
 async def get_session_laps(year: int, round_name: str, session_type: str = Query("R")):
     session = ff1.get_session(year, round_name, session_type)
     return {"laps": ff1.get_lap_times(session)}
 
-
 @app.get("/api/session/{year}/{round_name}/fastest")
 async def get_fastest(year: int, round_name: str, session_type: str = Query("R")):
     session = ff1.get_session(year, round_name, session_type)
     return {"fastest_laps": ff1.get_fastest_laps(session)}
 
-
 @app.get("/api/session/{year}/{round_name}/strategy")
 async def get_strategy(year: int, round_name: str):
     session = ff1.get_session(year, round_name, "R")
     return {"strategies": ff1.get_tyre_strategies(session)}
-
-
-@app.get("/api/session/{year}/{round_name}/positions")
-async def get_positions_hist(year: int, round_name: str):
-    session = ff1.get_session(year, round_name, "R")
-    return {"positions": ff1.get_position_history(session)}
-
 
 @app.get("/api/probabilities")
 async def get_probabilities():
@@ -271,7 +257,6 @@ async def get_probabilities():
         "podium":    podium_probability(rs),
         "incidents": safety_car_probability(rs),
     }
-
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
@@ -293,3 +278,4 @@ async def websocket_endpoint(ws: WebSocket):
         log.warning(f"WS error: {e}")
     finally:
         app_state.clients.discard(ws)
+        log.info(f"WS disconnected. Remaining: {len(app_state.clients)}")
