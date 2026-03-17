@@ -294,3 +294,102 @@ def get_race_status() -> Dict:
         days_until = max(0, int((dt - now).total_seconds() / 86400))
     return {"is_live":is_live,"is_weekend":is_weekend,"last_race":last_race,"next_race":next_race,
             "days_until_next":days_until,"season_round":last_race["round"] if last_race else 0,"total_rounds":len(CALENDAR_2026)}
+
+
+# ── Lap-by-lap replay data ────────────────────────────────────────────────────
+
+_replay_cache: Dict = {"data": None, "round": None, "fetched_at": 0}
+REPLAY_TTL = 3600  # 1 hour
+
+async def _fetch_lap_positions(year: int, round_num: int) -> Optional[Dict]:
+    """
+    Fetch lap-by-lap position for every driver from Jolpica.
+    Returns dict: { lap_number: [ {driver, position, code, team_color}, ... ] }
+    """
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            # Fetch all laps (limit 2000 covers ~57 laps × 20 drivers = 1140 rows)
+            r = await client.get(
+                f"{JOLPICA_BASE}/{year}/{round_num}/laps.json?limit=2000"
+            )
+            r.raise_for_status()
+            data  = r.json()
+            races = data.get("MRData", {}).get("RaceTable", {}).get("Races", [])
+            if not races:
+                return None
+
+            laps_raw = races[0].get("Laps", [])
+            if not laps_raw:
+                return None
+
+            # Also get driver → team mapping from standings
+            standings = get_standings()
+            driver_meta = {d["driver"]: d for d in standings}
+
+            lap_map: Dict[int, list] = {}
+            for lap_entry in laps_raw:
+                lap_num  = int(lap_entry.get("number", 0))
+                timings  = lap_entry.get("Timings", [])
+                lap_data = []
+                for t in timings:
+                    code = t.get("driverId", "").upper()[:3]
+                    # Jolpica uses full driverId like "max_verstappen"
+                    # Convert to 3-letter code
+                    did  = t.get("driverId", "")
+                    # Try to match against our standings
+                    meta = None
+                    for s in standings:
+                        if s["driver"].lower() == code.lower():
+                            meta = s
+                            break
+                        # Also try matching by last name fragment
+                        if did and s["full_name"].lower().replace(" ","_") in did.lower():
+                            meta = s
+                            break
+
+                    lap_data.append({
+                        "driver":     code,
+                        "driver_id":  did,
+                        "position":   int(t.get("position", 20)),
+                        "lap_time":   t.get("time", ""),
+                        "team_color": meta["team_color"] if meta else "#888888",
+                        "full_name":  meta["full_name"]  if meta else code,
+                        "team":       meta["team"]       if meta else "",
+                    })
+                # Sort by position
+                lap_data.sort(key=lambda x: x["position"])
+                lap_map[lap_num] = lap_data
+
+            return lap_map
+
+    except Exception as e:
+        log.warning(f"Lap position fetch failed: {e}")
+        return None
+
+
+async def get_replay_data() -> Optional[Dict]:
+    """Returns cached replay data, refreshing if stale."""
+    import time
+    last = get_last_race_results()
+    round_num = last.get("round", 0)
+    now = time.time()
+
+    if (
+        _replay_cache["data"] is not None
+        and _replay_cache["round"] == round_num
+        and (now - _replay_cache["fetched_at"]) < REPLAY_TTL
+    ):
+        return _replay_cache["data"]
+
+    log.info(f"Fetching lap replay data for Round {round_num}...")
+    lap_data = await _fetch_lap_positions(2026, round_num)
+
+    if lap_data:
+        _replay_cache["data"]       = lap_data
+        _replay_cache["round"]      = round_num
+        _replay_cache["fetched_at"] = now
+        log.info(f"Replay data: {len(lap_data)} laps loaded")
+    else:
+        log.warning("Lap data unavailable, replay will use synthetic data")
+
+    return _replay_cache["data"]
